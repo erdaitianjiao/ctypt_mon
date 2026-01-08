@@ -109,7 +109,7 @@
 
 // char LICENSE[] SEC("license") = "GPL";
 
-#include "vmlinux.h"
+// #include "vmlinux.h"
 #include "dm_crypt_types.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -146,11 +146,18 @@ struct {
 } rb SEC(".maps");
 
 static __always_inline void get_cipher_name(struct convert_context *ctx, char *dest)
-{
-    struct crypt_config *cc = BPF_CORE_READ(ctx, cc);
+{   
+    struct crypt_config_local *cc;
+    bpf_probe_read_kernel(&cc, sizeof(cc), ctx + 8);
+
     if (cc) {
-        BPF_CORE_READ_STR_INTO(dest, cc, cipher_string);
-    }
+        char *name_ptr;
+        // 假设 cipher_string 在 crypt_config 偏移 0 的位置
+        bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), (void *)cc);
+        if (name_ptr) {
+            bpf_probe_read_kernel_str(dest, 32, name_ptr);
+        }
+    }   
 }
 
 SEC("kprobe/crypt_convert")
