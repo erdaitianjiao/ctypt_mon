@@ -2,13 +2,14 @@
 #define __CRYPTMON_H
 
 struct event {
-    unsigned int pid;          
-    unsigned long long duration_ns; 
+    unsigned int pid;
+    unsigned int op;
+    unsigned int bytes;
+    unsigned int convert_calls;
     char comm[16];
-	char cipher[32];  		// 加密算法名称
-	unsigned long long crypt_time_ns;
-	unsigned long long total_time_ns;
-
+    char cipher[32];
+    unsigned long long convert_time_ns;
+    unsigned long long dm_total_time_ns;
 };
 
 #endif

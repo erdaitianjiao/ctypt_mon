@@ -26,6 +26,16 @@ check_deps() {
     done
 }
 
+require_cmds() {
+    local cmd
+    for cmd in "$@"; do
+        if ! command -v "${cmd}" &>/dev/null; then
+            err "Missing dependency: ${cmd}"
+            exit 1
+        fi
+    done
+}
+
 do_setup() {
     check_deps
     mkdir -p "${TEST_DIR}" "${MOUNT_BASE}"
@@ -152,9 +162,126 @@ do_io() {
     log "Workload complete."
 }
 
+do_trace() {
+    local dev="${2:-aes}"
+    local rw="${3:-randread}"
+    local runtime="${4:-10}"
+    local mnt="${MOUNT_BASE}/${dev}"
+    local mapped="/dev/mapper/crypt_test_aes"
+    local backing backing_name mapped_name output_dir stamp
+    local cryptmon_pid="" dm_trace_pid="" backing_trace_pid=""
+
+    if [ "${dev}" != "aes" ] && [ "${dev}" != "plain" ]; then
+        err "Device must be aes or plain"
+        exit 1
+    fi
+    case "${rw}" in
+        read|write|randread|randwrite) ;;
+        *) err "Workload must be read, write, randread, or randwrite"; exit 1 ;;
+    esac
+    if ! [[ "${runtime}" =~ ^[1-9][0-9]*$ ]]; then
+        err "Runtime must be a positive integer"
+        exit 1
+    fi
+    if [ ! -d "${mnt}" ] || ! mountpoint -q "${mnt}"; then
+        err "Test environment not set up. Run: sudo bash script/test.sh setup"
+        exit 1
+    fi
+    if [ "$(id -u)" -ne 0 ]; then
+        err "Tracing requires root privileges"
+        exit 1
+    fi
+    require_cmds fio blktrace blkparse lsblk findmnt mountpoint
+    if [ ! -x "${PROJECT_DIR}/cryptmon" ]; then
+        err "cryptmon not built. Run: nix-shell --run make"
+        exit 1
+    fi
+
+    if [ "${dev}" = "aes" ]; then
+        mapped_name="$(basename "$(readlink -f "${mapped}")")"
+        backing_name="$(lsblk -rno KNAME,PKNAME | awk -v name="${mapped_name}" \
+            '$1 == name { print $2; exit }')"
+        backing="/dev/${backing_name}"
+        if [ "${backing}" = "/dev/" ] || [ ! -b "${backing}" ]; then
+            err "Cannot resolve backing device for ${mapped}"
+            exit 1
+        fi
+    else
+        backing="$(findmnt -n -o SOURCE --target "${mnt}")"
+    fi
+
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    output_dir="${TEST_DIR}/trace-${dev}-${rw}-${stamp}"
+    mkdir -p "${output_dir}"
+
+    cleanup_trace() {
+        local pid
+        for pid in "${dm_trace_pid}" "${backing_trace_pid}" "${cryptmon_pid}"; do
+            if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+                kill -INT "${pid}" 2>/dev/null || true
+            fi
+        done
+        wait 2>/dev/null || true
+    }
+    trap cleanup_trace EXIT INT TERM
+
+    log "Trace output: ${output_dir}"
+    log "Workload: ${dev} ${rw}, ${runtime}s; backing device: ${backing}"
+
+    # 读负载需要在采集开始前创建并写满文件，避免把文件创建和稀疏块读取计入结果。
+    if [[ "${rw}" = *read ]]; then
+        log "Preparing 64 MiB input file before tracing..."
+        fio --name=prepare --filename="${mnt}/trace.dat" --rw=write --bs=1m \
+            --size=64m --direct=1 --ioengine=sync --iodepth=1 \
+            --numjobs=1 --group_reporting=1 >/dev/null
+        sync
+    fi
+
+    "${PROJECT_DIR}/cryptmon" >"${output_dir}/cryptmon.log" 2>&1 &
+    cryptmon_pid=$!
+
+    if [ "${dev}" = "aes" ]; then
+        blktrace -d "${mapped}" -D "${output_dir}" -o dm >"${output_dir}/blktrace-dm.log" 2>&1 &
+        dm_trace_pid=$!
+    fi
+    blktrace -d "${backing}" -D "${output_dir}" -o backing >"${output_dir}/blktrace-backing.log" 2>&1 &
+    backing_trace_pid=$!
+
+    sleep 1
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+    fio --name="cryptmon_${dev}_${rw}" --filename="${mnt}/trace.dat" \
+        --rw="${rw}" --bs=4k --size=64m --direct=1 --ioengine=libaio \
+        --iodepth=1 --numjobs=1 --time_based=1 --runtime="${runtime}" \
+        --group_reporting=1 --output-format=json \
+        --output="${output_dir}/fio.json"
+    sync
+
+    cleanup_trace
+    trap - EXIT INT TERM
+
+    if [ "${dev}" = "aes" ]; then
+        blkparse -i "${output_dir}/dm" -d "${output_dir}/dm.bin" \
+            -o "${output_dir}/dm.txt"
+    fi
+    blkparse -i "${output_dir}/backing" -d "${output_dir}/backing.bin" \
+        -o "${output_dir}/backing.txt"
+
+    if command -v btt &>/dev/null; then
+        if [ "${dev}" = "aes" ]; then
+            (cd "${output_dir}" && btt -i dm.bin >dm-btt.txt 2>&1) || true
+        fi
+        (cd "${output_dir}" && btt -i backing.bin >backing-btt.txt 2>&1) || true
+    fi
+
+    rm -f "${mnt}/trace.dat"
+    log "Trace complete: ${output_dir}"
+    log "Inspect cryptmon.log, fio.json, dm.txt/backing.txt and *-btt.txt"
+}
+
 usage() {
     cat <<EOF
-Usage: $0 {setup|teardown|status|io}
+Usage: $0 {setup|teardown|status|io|trace [aes|plain] [read|write|randread|randwrite] [seconds]}
 EOF
 }
 
@@ -163,5 +290,6 @@ case "${1:-}" in
     teardown) do_teardown ;;
     status)   do_status ;;
     io)       do_io ;;
+    trace)    do_trace "$@" ;;
     *)        usage; exit 1 ;;
 esac

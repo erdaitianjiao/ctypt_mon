@@ -10,6 +10,7 @@ pkgs.mkShell {
     elfutils
     zlib
     fio
+    blktrace
     pkg-config
   ];
   shellHook = "echo crypt_mon dev env ready";

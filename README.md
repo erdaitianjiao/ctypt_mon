@@ -1,6 +1,25 @@
 # crypt_mon
 
-基于 eBPF 的 dm-crypt 加密层 I/O 延迟监控工具。通过 kprobe 挂载 dm-crypt 内核函数，测量加密操作耗时。
+基于 eBPF 的 dm-crypt I/O 延迟观测工具。通过 kprobe 跟踪 dm-crypt
+内核函数，用于辅助分析加密磁盘的 I/O 性能损失。
+
+## 输出指标
+
+```text
+pid=1234 comm=fio op=write bytes=4096 cipher=aes-xts-plain64 convert=12 us calls=1 dm_total=85 us
+```
+
+- `pid` / `comm`：在 `crypt_map` 中记录的原始 I/O 发起者，而不是
+  `crypt_endio` 时的 worker 线程。
+- `op` / `bytes`：I/O 方向和请求字节数。
+- `convert`：一个 bio 相关的 `crypt_convert()` 函数调用累计耗时。
+- `calls`：累计的 `crypt_convert()` 调用次数。
+- `dm_total`：从 `crypt_map` 到 `crypt_endio` 的 dm-crypt 路径总耗时。
+
+> `convert` 是函数调用的墙钟时间，异步加密可能在函数返回后继续；
+> `dm_total` 则包含底层设备 I/O 和排队时间。两者都不应单独解释为
+> “AES 计算耗时”。评估整体性能损失时，仍应以相同 fio 负载下的
+> plain/dm-crypt 对照数据为主。
 
 ## 依赖
 
@@ -93,6 +112,27 @@ sudo bash script/test.sh status
 # 清理
 sudo bash script/test.sh teardown
 ```
+
+### eBPF + blktrace 分阶段采集
+
+`trace` 子命令在运行 fio 时同步采集 cryptmon 和 blktrace。AES 测试会同时
+跟踪 dm-crypt 设备与它的 backing 设备：
+
+```bash
+nix-shell --run make
+sudo env "PATH=$PATH" bash script/test.sh trace aes randread 10
+sudo env "PATH=$PATH" bash script/test.sh trace plain randread 10
+```
+
+每次采集会在 `test/trace-*` 下保存：
+
+- `cryptmon.log`：dm-crypt 内部的 convert 和总路径数据。
+- `fio.json`：负载的 IOPS、带宽和延迟数据。
+- `dm.txt` / `backing.txt`：block 层 Q/I/D/C 事件。
+- `dm-btt.txt` / `backing-btt.txt`：btt 生成的排队、服务和完成时间报告。
+
+`blktrace` 能帮助区分 block queue/device 时间，但不能直接测量 AES 执行时间。
+当 backing 设备是 loop 时，结果还包含 loop 和宿主文件系统开销，不等价于裸块设备测试。
 
 测试设备：
 
