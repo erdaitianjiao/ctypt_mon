@@ -1,0 +1,7 @@
+.git
+.vscode
+test
+cryptmon
+*.o
+*.img
+*.swp

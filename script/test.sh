@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TEST_DIR="${PROJECT_DIR}/test"
-DISK_SIZE_MB=100
-MOUNT_BASE=/mnt/crypt_test
+DISK_SIZE_MB="${CRYPTMON_DISK_SIZE_MB:-256}"
+MOUNT_BASE="${CRYPTMON_MOUNT_BASE:-/mnt/crypt_test}"
+BENCH_SIZE="${CRYPTMON_BENCH_SIZE:-64m}"
 
 # NixOS: sudo 会重置 PATH，补上系统路径
 export PATH="/run/current-system/sw/sbin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/sbin:/nix/var/nix/profiles/default/bin:${PATH}"
@@ -16,6 +17,13 @@ NC='\033[0m'
 
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
 err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        err "This command requires root privileges"
+        exit 1
+    fi
+}
 
 check_deps() {
     for cmd in dmsetup losetup mkfs.ext4; do
@@ -37,8 +45,19 @@ require_cmds() {
 }
 
 do_setup() {
+    require_root
     check_deps
+    require_cmds blockdev mount mountpoint
+
+    if dmsetup info crypt_test_aes &>/dev/null ||
+       mountpoint -q "${MOUNT_BASE}/aes" || mountpoint -q "${MOUNT_BASE}/plain" ||
+       [ -e "${TEST_DIR}/aes.img" ] || [ -e "${TEST_DIR}/plain.img" ]; then
+        err "Existing crypt_mon test environment detected; refusing to overwrite it"
+        err "Inspect with: $0 status; remove explicitly with: $0 teardown"
+        exit 1
+    fi
     mkdir -p "${TEST_DIR}" "${MOUNT_BASE}"
+    trap 'err "Setup failed; removing the partially created environment"; do_teardown' ERR
 
     # AES: dm-crypt 加密设备
     local name=aes cipher=aes-xts-plain64
@@ -46,7 +65,7 @@ do_setup() {
     local img="${TEST_DIR}/${name}.img" mnt="${MOUNT_BASE}/${name}"
 
     log "Setting up aes (${cipher})..."
-    dd if=/dev/zero of="${img}" bs=1M count=${DISK_SIZE_MB} status=none
+    dd if=/dev/zero of="${img}" bs=1M count="${DISK_SIZE_MB}" status=none
     local loop
     loop=$(losetup --find --show "${img}")
     log "  Loop: ${loop}"
@@ -64,7 +83,7 @@ do_setup() {
     img="${TEST_DIR}/${name}.img" mnt="${MOUNT_BASE}/${name}"
 
     log "Setting up plain (direct loop, no dm-crypt)..."
-    dd if=/dev/zero of="${img}" bs=1M count=${DISK_SIZE_MB} status=none
+    dd if=/dev/zero of="${img}" bs=1M count="${DISK_SIZE_MB}" status=none
     loop=$(losetup --find --show "${img}")
     log "  Loop: ${loop}"
     mkfs.ext4 -q -F "${loop}"
@@ -76,32 +95,36 @@ do_setup() {
     log "Ready! AES: /mnt/crypt_test/aes | Plain: /mnt/crypt_test/plain"
     log "Run: sudo ./cryptmon"
     log "I/O: sudo bash script/test.sh io"
+    trap - ERR
 }
 
 do_teardown() {
+    require_root
     log "Cleaning up..."
     for name in aes plain; do
         umount "${MOUNT_BASE}/${name}" 2>/dev/null || true
         dmsetup remove "crypt_test_${name}" 2>/dev/null || true
     done
-    for img in "${TEST_DIR}"/*.img; do
+    for img in "${TEST_DIR}/aes.img" "${TEST_DIR}/plain.img"; do
         [ -f "$img" ] || continue
         local loop
         loop=$(losetup -j "${img}" 2>/dev/null | cut -d: -f1)
         [ -n "$loop" ] && losetup -d "$loop" 2>/dev/null || true
     done
-    rm -f "${TEST_DIR}"/*.img
+    rm -f "${TEST_DIR}/aes.img" "${TEST_DIR}/plain.img"
     rmdir "${MOUNT_BASE}"/{aes,plain} 2>/dev/null || true
     rmdir "${MOUNT_BASE}" 2>/dev/null || true
     log "Cleanup done."
 }
 
 do_status() {
-    dmsetup ls | grep crypt_test || echo "No dm-crypt devices"
-    mount | grep crypt_test || echo "No mounts"
+    require_root
+    dmsetup ls 2>/dev/null | grep crypt_test || echo "No dm-crypt devices"
+    findmnt -rn | grep "${MOUNT_BASE}" || echo "No crypt_mon mounts"
 }
 
 do_io() {
+    require_root
     if [ ! -d "${MOUNT_BASE}/aes" ]; then
         err "Test environment not set up. Run: sudo bash script/test.sh setup"
         exit 1
@@ -162,6 +185,122 @@ do_io() {
     log "Workload complete."
 }
 
+prepare_benchmark_file() {
+    local dev="$1"
+    local file="${MOUNT_BASE}/${dev}/bench.dat"
+
+    if [ ! -f "${file}" ]; then
+        log "Preparing ${BENCH_SIZE} benchmark file on ${dev}..."
+        fio --name="prepare_${dev}" --filename="${file}" --rw=write --bs=1m \
+            --size="${BENCH_SIZE}" --direct=1 --ioengine=sync --iodepth=1 \
+            --numjobs=1 --group_reporting=1 >/dev/null
+        sync
+    fi
+}
+
+do_benchmark() {
+    local runtime="${2:-5}"
+    local rounds="${3:-3}"
+    local stamp output_dir round dev rw
+
+    require_root
+    require_cmds fio jq mountpoint
+    if ! [[ "${runtime}" =~ ^[1-9][0-9]*$ ]] ||
+       ! [[ "${rounds}" =~ ^[1-9][0-9]*$ ]]; then
+        err "Runtime and rounds must be positive integers"
+        exit 1
+    fi
+    for dev in aes plain; do
+        if ! mountpoint -q "${MOUNT_BASE}/${dev}"; then
+            err "Test environment not set up: ${MOUNT_BASE}/${dev}"
+            exit 1
+        fi
+        prepare_benchmark_file "${dev}"
+    done
+
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    output_dir="${TEST_DIR}/benchmark-${stamp}"
+    mkdir -p "${output_dir}"
+    log "Clean benchmark output: ${output_dir}"
+
+    for ((round = 1; round <= rounds; round++)); do
+        # Alternate device order to reduce systematic host writeback bias.
+        if ((round % 2)); then
+            dev_order=(plain aes)
+        else
+            dev_order=(aes plain)
+        fi
+        for dev in "${dev_order[@]}"; do
+            for rw in randread randwrite; do
+                sync
+                echo 3 > /proc/sys/vm/drop_caches
+                fio --name="${dev}_${rw}" \
+                    --filename="${MOUNT_BASE}/${dev}/bench.dat" \
+                    --rw="${rw}" --bs=4k --size="${BENCH_SIZE}" --direct=1 \
+                    --ioengine=libaio --iodepth=1 --numjobs=1 --time_based=1 \
+                    --runtime="${runtime}" --group_reporting=1 --output-format=json \
+                    --output="${output_dir}/${dev}-${rw}-${round}.json"
+                log "round=${round}/${rounds} dev=${dev} rw=${rw} complete"
+            done
+        done
+    done
+
+    {
+        echo -e "device\toperation\tround\tiops\tmean_clat_us\tp99_clat_us"
+        for dev in plain aes; do
+            for rw in randread randwrite; do
+                local op="${rw#rand}"
+                for ((round = 1; round <= rounds; round++)); do
+                    jq -r --arg dev "${dev}" --arg op "${op}" --arg round "${round}" \
+                        '[ $dev, $op, $round,
+                           .jobs[0][$op].iops,
+                           (.jobs[0][$op].clat_ns.mean / 1000),
+                           (.jobs[0][$op].clat_ns.percentile["99.000000"] / 1000) ] | @tsv' \
+                        "${output_dir}/${dev}-${rw}-${round}.json"
+                done
+            done
+        done
+    } >"${output_dir}/summary.tsv"
+    awk -F '\t' '
+        NR == 1 { next }
+        {
+            key = $1 "\t" $2
+            count[key]++
+            iops[key] += $4
+            mean[key] += $5
+            p99[key] += $6
+        }
+        END {
+            print "| device | operation | rounds | mean IOPS | mean clat (us) | mean P99 (us) |"
+            print "|---|---|---:|---:|---:|---:|"
+            for (key in count) {
+                split(key, part, "\t")
+                printf "| %s | %s | %d | %.1f | %.3f | %.3f |\n", \
+                    part[1], part[2], count[key], iops[key] / count[key], \
+                    mean[key] / count[key], p99[key] / count[key]
+            }
+        }
+    ' "${output_dir}/summary.tsv" >"${output_dir}/summary.md"
+    log "Benchmark complete: ${output_dir}/summary.tsv"
+}
+
+do_aes_benchmark() {
+    local output="${2:-${TEST_DIR}/aes-benchmark-$(date +%Y%m%d-%H%M%S).txt}"
+    require_cmds cryptsetup
+    mkdir -p "$(dirname "${output}")"
+    {
+        echo "# cryptsetup AES-XTS memory benchmark"
+        echo "# date: $(date --iso-8601=seconds)"
+        for bits in 256 512; do
+            for round in 1 2 3; do
+                echo "key=${bits} round=${round}"
+                cryptsetup benchmark --cipher aes-xts-plain64 --key-size "${bits}" | tail -2
+            done
+        done
+    } | tee "${output}"
+    log "AES benchmark complete: ${output}"
+}
+
 do_trace() {
     local dev="${2:-aes}"
     local rw="${3:-randread}"
@@ -187,10 +326,7 @@ do_trace() {
         err "Test environment not set up. Run: sudo bash script/test.sh setup"
         exit 1
     fi
-    if [ "$(id -u)" -ne 0 ]; then
-        err "Tracing requires root privileges"
-        exit 1
-    fi
+    require_root
     require_cmds fio blktrace blkparse lsblk findmnt mountpoint
     if [ ! -x "${PROJECT_DIR}/cryptmon" ]; then
         err "cryptmon not built. Run: nix-shell --run make"
@@ -237,7 +373,11 @@ do_trace() {
         sync
     fi
 
-    "${PROJECT_DIR}/cryptmon" >"${output_dir}/cryptmon.log" 2>&1 &
+    if [ "${dev}" = "aes" ]; then
+        "${PROJECT_DIR}/cryptmon" >"${output_dir}/cryptmon.log" 2>&1 &
+    else
+        "${PROJECT_DIR}/cryptmon" -d "${backing}" >"${output_dir}/cryptmon.log" 2>&1 &
+    fi
     cryptmon_pid=$!
 
     if [ "${dev}" = "aes" ]; then
@@ -281,7 +421,16 @@ do_trace() {
 
 usage() {
     cat <<EOF
-Usage: $0 {setup|teardown|status|io|trace [aes|plain] [read|write|randread|randwrite] [seconds]}
+Usage: $0 COMMAND [arguments]
+
+Commands:
+  setup
+  teardown
+  status
+  io
+  benchmark [seconds] [rounds]
+  aes-benchmark [output-file]
+  trace [aes|plain] [read|write|randread|randwrite] [seconds]
 EOF
 }
 
@@ -290,6 +439,8 @@ case "${1:-}" in
     teardown) do_teardown ;;
     status)   do_status ;;
     io)       do_io ;;
+    benchmark) do_benchmark "$@" ;;
+    aes-benchmark) do_aes_benchmark "$@" ;;
     trace)    do_trace "$@" ;;
     *)        usage; exit 1 ;;
 esac

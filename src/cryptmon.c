@@ -2,6 +2,10 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "cryptmon.h"
 #include "cryptmon.skel.h"
@@ -28,11 +32,28 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int data_sz) {
     (void)cpu;
     if (data_sz < sizeof(*e))
         return;
+    if (e->type == CRYPTMON_EVENT_BLOCK) {
+        printf("type=device dev=%u:%u pid=%-8u comm=%-16s op=%-7s "
+               "bytes=%-8u device=%9.3f us\n",
+               e->dev_major, e->dev_minor, e->pid, e->comm,
+               op_name(e->op), e->bytes, e->device_time_ns / 1000.0);
+        return;
+    }
     printf("pid=%-8u comm=%-16s op=%-7s bytes=%-8u cipher=%-16s "
-           "convert=%10.3f us calls=%-3u dm_total=%10.3f us\n",
+           "qcrypt=%9.3f us qsubmit=%9.3f us wqwait=%9.3f us queue=%9.3f us "
+           "crypto=%9.3f us device=%9.3f us "
+           "completion=%9.3f us total=%9.3f us stages=%c%c%c%c\n",
            e->pid, e->comm, op_name(e->op), e->bytes, e->cipher,
-           e->convert_time_ns / 1000.0, e->convert_calls,
-           e->dm_total_time_ns / 1000.0);
+           e->crypto_queue_time_ns / 1000.0,
+           e->submit_queue_time_ns / 1000.0,
+           e->workqueue_time_ns / 1000.0,
+           e->queue_time_ns / 1000.0, e->crypto_time_ns / 1000.0,
+           e->device_time_ns / 1000.0, e->completion_time_ns / 1000.0,
+           e->total_time_ns / 1000.0,
+           e->stage_mask & CRYPTMON_STAGE_QUEUE ? 'Q' : '-',
+           e->stage_mask & CRYPTMON_STAGE_CRYPTO ? 'K' : '-',
+           e->stage_mask & CRYPTMON_STAGE_DEVICE ? 'D' : '-',
+           e->stage_mask & CRYPTMON_STAGE_COMPLETION ? 'C' : '-');
 }
 
 static void handle_lost_events(void *ctx, int cpu, unsigned long long count) {
@@ -40,18 +61,64 @@ static void handle_lost_events(void *ctx, int cpu, unsigned long long count) {
     fprintf(stderr, "Lost %llu events on CPU %d\n", count, cpu);
 }
 
-int main() {
+int main(int argc, char **argv) {
     struct cryptmon_bpf *skel;
     struct perf_buffer *pb;
+    struct device_filter filter = {};
+    struct stat st;
+    unsigned int config_key = 0;
     int err = 0;
+
+    if (argc == 3 && strcmp(argv[1], "-d") == 0) {
+        if (stat(argv[2], &st) || !S_ISBLK(st.st_mode)) {
+            fprintf(stderr, "Not a block device: %s\n", argv[2]);
+            return 1;
+        }
+        filter.major = major(st.st_rdev);
+        filter.minor = minor(st.st_rdev);
+    } else if (argc != 1) {
+        fprintf(stderr, "Usage: %s [-d block-device]\n", argv[0]);
+        return 1;
+    }
 
     printf("crypt_mon is running... (Ctrl+C to stop)\n");
     signal(SIGINT, sig_handler);
 
-    skel = cryptmon_bpf__open_and_load();
+    skel = cryptmon_bpf__open();
     if (!skel) {
-        fprintf(stderr, "Failed to open and load BPF program\n");
+        fprintf(stderr, "Failed to open BPF program\n");
         return 1;
+    }
+
+    if (filter.major || filter.minor) {
+        bpf_program__set_autoload(skel->progs.crypt_map, false);
+        bpf_program__set_autoload(skel->progs.crypt_convert_entry, false);
+        bpf_program__set_autoload(skel->progs.crypt_work_queued, false);
+        bpf_program__set_autoload(skel->progs.crypt_worker_started, false);
+        bpf_program__set_autoload(skel->progs.crypt_write_crypto_done, false);
+        bpf_program__set_autoload(skel->progs.crypt_read_crypto_done, false);
+        bpf_program__set_autoload(skel->progs.crypt_device_submit, false);
+        bpf_program__set_autoload(skel->progs.crypt_device_done, false);
+    } else {
+        bpf_program__set_autoload(skel->progs.block_device_submit, false);
+    }
+
+    err = cryptmon_bpf__load(skel);
+    if (err) {
+        fprintf(stderr, "Failed to load BPF program: %d\n", err);
+        goto cleanup;
+    }
+
+    if (filter.major || filter.minor) {
+        err = bpf_map_update_elem(bpf_map__fd(skel->maps.device_config),
+                                  &config_key, &filter, BPF_ANY);
+        if (err) {
+            fprintf(stderr, "Failed to configure device %s: %s\n",
+                    argv[2], strerror(errno));
+            goto cleanup;
+        }
+        printf("Tracing block device %s (%u:%u)\n", argv[2],
+               filter.major, filter.minor);
     }
 
     err = cryptmon_bpf__attach(skel);
@@ -75,6 +142,9 @@ int main() {
             break;
         }
     }
+
+    if (stop && err == -EINTR)
+        err = 0;
 
     perf_buffer__free(pb);
 cleanup:
