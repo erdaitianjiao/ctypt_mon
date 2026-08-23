@@ -1,6 +1,6 @@
 *.o
 *.img
-test_dir/*
 .vscode/*
 cryptmon
 *.swp
+test/

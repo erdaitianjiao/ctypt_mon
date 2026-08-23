@@ -13,11 +13,11 @@ struct io_timestamps {
     u64 total_start_time;    // 总开始时间（用于计算total_time_ns）
 };
 
-// BPF Maps
+// BPF Maps - 使用bio指针作为key，避免调用dm_per_bio_data
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
-    __type(key, struct dm_crypt_io *);
+    __type(key, struct bio *);
     __type(value, struct io_timestamps);
 } io_timestamps_map SEC(".maps");
 
@@ -27,31 +27,24 @@ struct {
     __uint(value_size, sizeof(u32));
 } events SEC(".maps");
 
-// 进入加密层
+// 进入加密层 - 直接用bio作为key，不需要dm_per_bio_data
 SEC("kprobe/crypt_map")
 int BPF_KPROBE(crypt_map, struct dm_target *ti, struct bio *bio)
 {	
 	u64 ts = bpf_ktime_get_ns();
-	void *io_ptr = (void *)dm_per_bio_data(bio, BPF_CORE_READ(ti, per_io_data_size));
 	
-	// 获取dm_crypt_io指针
-	struct dm_crypt_io *io = (struct dm_crypt_io *)io_ptr;
-	if (!io) {
-		return 0;
-	}
-	
-	// 初始化时间戳结构
+	// 初始化时间戳结构，以bio为key
 	struct io_timestamps timestamps = {};
 	timestamps.crypt_map_time = ts;
 	timestamps.total_start_time = ts;
 	
 	// 存储到map中
-	bpf_map_update_elem(&io_timestamps_map, &io, &timestamps, BPF_ANY);
+	bpf_map_update_elem(&io_timestamps_map, &bio, &timestamps, BPF_ANY);
 	
 	return 0;
 }
 
-// 加密处理函数
+// 加密处理函数 - 通过io->base_bio回溯到原始bio作为key
 SEC("kprobe/crypt_convert")
 int BPF_KPROBE(crypt_convert_entry, struct crypt_config *cc, struct convert_context *dm_ctx)
 {	
@@ -62,23 +55,27 @@ int BPF_KPROBE(crypt_convert_entry, struct crypt_config *cc, struct convert_cont
 		return 0;
 	}
 
+	// 通过base_bio回溯到原始bio
+	struct bio *bio = BPF_CORE_READ(io, base_bio);
+	if (!bio) {
+		return 0;
+	}
+
 	u64 ts = bpf_ktime_get_ns();
 	
 	// 从map中获取或创建时间戳结构
-	struct io_timestamps *timestamps = bpf_map_lookup_elem(&io_timestamps_map, &io);
+	struct io_timestamps *timestamps = bpf_map_lookup_elem(&io_timestamps_map, &bio);
 	if (timestamps) {
 		timestamps->crypt_start_time = ts;
-		// 如果total_start_time未设置，使用当前时间
 		if (timestamps->total_start_time == 0) {
 			timestamps->total_start_time = ts;
 		}
-		bpf_map_update_elem(&io_timestamps_map, &io, timestamps, BPF_ANY);
+		bpf_map_update_elem(&io_timestamps_map, &bio, timestamps, BPF_ANY);
 	} else {
-		// 如果map中没有，创建新的条目
 		struct io_timestamps new_ts = {};
 		new_ts.crypt_start_time = ts;
 		new_ts.total_start_time = ts;
-		bpf_map_update_elem(&io_timestamps_map, &io, &new_ts, BPF_ANY);
+		bpf_map_update_elem(&io_timestamps_map, &bio, &new_ts, BPF_ANY);
 	}
 	
 	return 0;
@@ -103,10 +100,16 @@ int BPF_KPROBE(crypt_endio, struct bio *clone)
 		return 0;
 	}
 
+	// 通过base_bio回溯到原始bio
+	struct bio *bio = BPF_CORE_READ(io, base_bio);
+	if (!bio) {
+		return 0;
+	}
+
 	u64 end_time = bpf_ktime_get_ns();
 	
 	// 从map中获取时间戳
-	struct io_timestamps *timestamps = bpf_map_lookup_elem(&io_timestamps_map, &io);
+	struct io_timestamps *timestamps = bpf_map_lookup_elem(&io_timestamps_map, &bio);
 	if (!timestamps) {
 		return 0;
 	}
@@ -115,12 +118,8 @@ int BPF_KPROBE(crypt_endio, struct bio *clone)
 	u64 crypt_time_ns = 0;
 	u64 total_time_ns = 0;
 	
-	// 如果crypt_end_time已设置（从kretprobe），使用它；否则使用当前时间
-	u64 crypt_end = timestamps->crypt_end_time > 0 ? timestamps->crypt_end_time : end_time;
-	
 	if (timestamps->crypt_start_time > 0) {
-		// 加密时间 = crypt_convert结束时间 - crypt_convert开始时间
-		crypt_time_ns = crypt_end - timestamps->crypt_start_time;
+		crypt_time_ns = end_time - timestamps->crypt_start_time;
 	}
 	
 	if (timestamps->total_start_time > 0) {
@@ -130,9 +129,8 @@ int BPF_KPROBE(crypt_endio, struct bio *clone)
 	// 获取进程信息
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	u32 pid = pid_tgid >> 32;
-	u32 tid = (u32)pid_tgid;
 	
-	// 获取进程名
+	// 获取进程名和加密算法
 	struct event evt = {};
 	evt.pid = pid;
 	bpf_get_current_comm(&evt.comm, sizeof(evt.comm));
@@ -153,7 +151,7 @@ int BPF_KPROBE(crypt_endio, struct bio *clone)
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
 	
 	// 清理map条目
-	bpf_map_delete_elem(&io_timestamps_map, &io);
+	bpf_map_delete_elem(&io_timestamps_map, &bio);
 	
 	return 0;
 }

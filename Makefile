@@ -6,8 +6,8 @@ BPF_C := $(SRC_DIR)/$(TARGET).bpf.c
 SKEL := $(SRC_DIR)/$(TARGET).skel.h
 USER_C := $(SRC_DIR)/$(TARGET).c
 
-INCLUDES := -I$(SRC_DIR) -I/usr/include
-LIBS := -l:libbpf.so.1.7.0 -lelf -lz
+INCLUDES := -I$(SRC_DIR) $(shell pkg-config --cflags libbpf libelf 2>/dev/null)
+LIBS := $(shell pkg-config --libs libbpf libelf 2>/dev/null) -lz
 
 .PHONY: all clean run log
 
